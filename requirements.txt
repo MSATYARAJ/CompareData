@@ -1,3 +1,4 @@
 streamlit
 xlsxwriter
 python_calamine
+openpyxl
