@@ -11,7 +11,7 @@ st.title("🚀 Professional Data Comparison Tool")
 # 2. Sidebar Controls
 with st.sidebar:
     st.header("Controls")
-    if st.button("🧹 Clear Comparison Results", use_container_width=True):
+    if st.button(" (Clear Results)", use_container_width=True):
         if 'audit' in st.session_state:
             del st.session_state['audit']
         st.success("Results cleared. Files kept.")
@@ -55,7 +55,7 @@ if file1 and file2:
             select_all = st.checkbox("Select All Columns")
             comps = st.multiselect("Select Columns to Compare:", options=remaining, default=remaining if select_all else [])
         
-        # --- NEW: Duplicate Key Check ---
+        # --- Duplicate Key Check ---
         duplicates_found = False
         if keys:
             d1_dupes = df1[df1.duplicated(subset=keys)].shape[0]
@@ -64,24 +64,23 @@ if file1 and file2:
             if d1_dupes > 0 or d2_dupes > 0:
                 duplicates_found = True
                 st.warning(f"⚠️ **Duplicate Keys Detected!** (File 1: {d1_dupes}, File 2: {d2_dupes})")
-                st.info("Duplicates cause shape mismatch errors or bloated results. Please use unique keys or clean below.")
                 clean_dupes = st.checkbox("Automatically clean duplicates (Keep first instance)")
                 if clean_dupes:
                     df1 = df1.drop_duplicates(subset=keys)
                     df2 = df2.drop_duplicates(subset=keys)
-                    duplicates_found = False # Reset flag if user opted to clean
+                    duplicates_found = False 
         
         run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True, disabled=duplicates_found and not keys)
 
-    # 6. EXECUTION LOGIC (Using Inner Merge to fix shape issues)
+    # 6. EXECUTION LOGIC (Optimized for 150k+ rows)
     if run_btn and keys:
-        with st.spinner("Executing optimized comparison..."):
-            # Standardize Join Keys (strip spaces and convert to string)
+        with st.spinner("Analyzing datasets..."):
+            # Standardize Join Keys
             for c in keys:
                 df1[c] = df1[c].astype(str).str.strip()
                 df2[c] = df2[c].astype(str).str.strip()
 
-            # Align using an Inner Merge (This ensures both arrays have same shape)
+            # A. ALIGN: Inner Join for direct comparison
             cols_to_use = list(set(keys + comps))
             df_merged = pd.merge(
                 df1[cols_to_use], 
@@ -92,34 +91,39 @@ if file1 and file2:
             )
             
             final_report = pd.DataFrame()
-            if comps:
-                # Prepare matrices for vectorized comparison
+            if not df_merged.empty and comps:
+                # Vectorized Matrix Comparison
                 d1_v = df_merged[[f"{c}_F1" for c in comps]].fillna('N/A').values
                 d2_v = df_merged[[f"{c}_F2" for c in comps]].fillna('N/A').values
                 
-                # Check for any mismatch across columns
-                mask = (d1_v != d2_v).any(axis=1)
+                # Create boolean mask where rows are different
+                diff_mask = (d1_v != d2_v).any(axis=1)
                 
-                if mask.any():
-                    # Build report for mismatched rows
-                    report_df = df_merged.loc[mask, keys].copy()
-                    for col in comps:
-                        v1 = df_merged.loc[mask, f"{col}_F1"]
-                        v2 = df_merged.loc[mask, f"{col}_F2"]
-                        report_df[f"{col}_F1"] = v1
-                        report_df[f"{col}_F2"] = v2
-                        report_df[f"{col}_Equal"] = np.where(v1.fillna('N/A') == v2.fillna('N/A'), "Yes", "No")
-                    final_report = report_df
+                if diff_mask.any():
+                    # Filter for mismatches
+                    final_report = df_merged[diff_mask].copy()
+                    # Optional: Add a "Reason" column indicating which columns differ
+                    # This is better than adding "Yes/No" for every single column
+                    diff_cols = []
+                    for i, col in enumerate(comps):
+                        col_diff = (d1_v[:, i] != d2_v[:, i])
+                        # If you want to keep the "No" logic:
+                        final_report[f"{col}_Diff"] = np.where(col_diff, "DIFF", "")
 
-            # Calculate Orphans using sets for speed
-            s1 = set(df1[keys].itertuples(index=False, name=None))
-            s2 = set(df2[keys].itertuples(index=False, name=None))
+            # B. ORPHANS: Vectorized check using Indicator Merge (Fastest way)
+            indicator_df = pd.merge(df1[keys], df2[keys], on=keys, how='outer', indicator=True)
+            
+            orphans_f1_keys = indicator_df[indicator_df['_merge'] == 'left_only'][keys]
+            orphans_f2_keys = indicator_df[indicator_df['_merge'] == 'right_only'][keys]
+
+            orphans_f1 = pd.merge(orphans_f1_keys, df1, on=keys, how='inner')
+            orphans_f2 = pd.merge(orphans_f2_keys, df2, on=keys, how='inner')
             
             st.session_state['audit'] = {
                 'report': final_report,
-                'orphans_f1': df1[~df1[keys].apply(tuple, axis=1).isin(s2)],
-                'orphans_f2': df2[~df2[keys].apply(tuple, axis=1).isin(s1)],
-                'metrics': (len(df_merged), len(s1 - s2), len(s2 - s1))
+                'orphans_f1': orphans_f1,
+                'orphans_f2': orphans_f2,
+                'metrics': (len(df_merged), len(orphans_f1), len(orphans_f2))
             }
 
     # 7. RESULTS DISPLAY & EXPORT
@@ -132,34 +136,41 @@ if file1 and file2:
         m4.metric("Mismatch Rows", len(res['report']))
 
         if not res['report'].empty:
+            st.subheader("🚩 Mismatched Data (Matched Keys, Different Values)")
+            # Apply styling only to a preview of the first 1000 rows to keep UI fast
             st.dataframe(
-                res['report'].head(3000).style.map(lambda x: 'background-color: #ffcccc; color: #900' if x == "No" else ''),
+                res['report'].head(1000).style.applymap(
+                    lambda x: 'background-color: #ffcccc; color: #900' if x == "DIFF" else '',
+                    subset=[c for c in res['report'].columns if c.endswith('_Diff')]
+                ),
                 use_container_width=True
             )
         else:
             st.success("✅ No differences found in matched records.")
 
         st.divider()
-        st.subheader("🚩 Orphan Records")
+        st.subheader("🔍 Orphan Records")
         oc1, oc2 = st.columns(2)
         with oc1:
-            st.write("**Only in Dataset 1**")
-            st.dataframe(res['orphans_f1'].head(100), use_container_width=True)
+            st.write(f"**Only in Dataset 1 ({len(res['orphans_f1'])} rows)**")
+            st.dataframe(res['orphans_f1'].head(500), use_container_width=True)
         with oc2:
-            st.write("**Only in Dataset 2**")
-            st.dataframe(res['orphans_f2'].head(100), use_container_width=True)
+            st.write(f"**Only in Dataset 2 ({len(res['orphans_f2'])} rows)**")
+            st.dataframe(res['orphans_f2'].head(500), use_container_width=True)
 
+        # 8. EXPORT
         st.divider()
         st.subheader("📥 Export Audit Report")
-        fmt = st.radio("Format:", ["Excel", "CSV"], horizontal=True)
-
-        if fmt == "Excel":
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                if not res['report'].empty: res['report'].to_excel(writer, index=False, sheet_name='Mismatches')
-                res['orphans_f1'].to_excel(writer, index=False, sheet_name='Only_F1')
-                res['orphans_f2'].to_excel(writer, index=False, sheet_name='Only_F2')
-            st.download_button("💾 Download All", buf.getvalue(), "Audit_Report.xlsx")
-        else:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
             if not res['report'].empty: 
-                st.download_button("📄 Mismatches (CSV)", to_csv_bytes(res['report']), "mismatches.csv")
+                res['report'].to_excel(writer, index=False, sheet_name='Mismatches')
+            res['orphans_f1'].to_excel(writer, index=False, sheet_name='Only_F1')
+            res['orphans_f2'].to_excel(writer, index=False, sheet_name='Only_F2')
+        
+        st.download_button(
+            label="💾 Download Full Audit (.xlsx)",
+            data=buf.getvalue(),
+            file_name="Audit_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
