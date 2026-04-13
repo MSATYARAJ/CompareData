@@ -8,24 +8,22 @@ st.set_page_config(page_title="High-Speed Audit", layout="wide")
 pd.set_option("styler.render.max_elements", 20000000)
 st.title("🚀 Professional Data Comparison Tool")
 
-# 2. Sidebar - Partial Reset Logic
+# 2. Sidebar Controls
 with st.sidebar:
     st.header("Controls")
-    # This button only clears the comparison results, NOT the uploaded files
     if st.button("🧹 Clear Comparison Results", use_container_width=True):
         if 'audit' in st.session_state:
             del st.session_state['audit']
-        st.success("Comparison results cleared. Files kept.")
+        st.success("Results cleared. Files kept.")
     
     st.divider()
-    # Optional: Full reset if they want to change files entirely
     if st.button("🔄 Full Reset (Clear Files)", type="secondary"):
         st.cache_data.clear()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
 
-# 3. Optimized Data Loading
+# 3. Data Loading Utilities
 @st.cache_data
 def load_data(file):
     if file.name.endswith(".csv"):
@@ -57,71 +55,85 @@ if file1 and file2:
             select_all = st.checkbox("Select All Columns")
             comps = st.multiselect("Select Columns to Compare:", options=remaining, default=remaining if select_all else [])
         
-        run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+        # --- NEW: Duplicate Key Check ---
+        duplicates_found = False
+        if keys:
+            d1_dupes = df1[df1.duplicated(subset=keys)].shape[0]
+            d2_dupes = df2[df2.duplicated(subset=keys)].shape[0]
+            
+            if d1_dupes > 0 or d2_dupes > 0:
+                duplicates_found = True
+                st.warning(f"⚠️ **Duplicate Keys Detected!** (File 1: {d1_dupes}, File 2: {d2_dupes})")
+                st.info("Duplicates cause shape mismatch errors or bloated results. Please use unique keys or clean below.")
+                clean_dupes = st.checkbox("Automatically clean duplicates (Keep first instance)")
+                if clean_dupes:
+                    df1 = df1.drop_duplicates(subset=keys)
+                    df2 = df2.drop_duplicates(subset=keys)
+                    duplicates_found = False # Reset flag if user opted to clean
+        
+        run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True, disabled=duplicates_found and not keys)
 
-    # 6. EXECUTION LOGIC (Stored in Session State)
+    # 6. EXECUTION LOGIC (Using Inner Merge to fix shape issues)
     if run_btn and keys:
         with st.spinner("Executing optimized comparison..."):
-            # Standardize Join Keys
+            # Standardize Join Keys (strip spaces and convert to string)
             for c in keys:
                 df1[c] = df1[c].astype(str).str.strip()
                 df2[c] = df2[c].astype(str).str.strip()
 
-            # Fast Orphan Detection using Sets
-            s1 = set(df1.set_index(keys).index)
-            s2 = set(df2.set_index(keys).index)
-            matched_idx = list(s1.intersection(s2))
+            # Align using an Inner Merge (This ensures both arrays have same shape)
+            cols_to_use = list(set(keys + comps))
+            df_merged = pd.merge(
+                df1[cols_to_use], 
+                df2[cols_to_use], 
+                on=keys, 
+                how='inner', 
+                suffixes=('_F1', '_F2')
+            )
             
-            # Align DataFrames
-            df1_m = df1.set_index(keys).loc[matched_idx].sort_index().reset_index()
-            df2_m = df2.set_index(keys).loc[matched_idx].sort_index().reset_index()
-            
-            # Vectorized Matrix Comparison
             final_report = pd.DataFrame()
             if comps:
-                d1_v = df1_m[comps].fillna('N/A').values
-                d2_v = df2_m[comps].fillna('N/A').values
+                # Prepare matrices for vectorized comparison
+                d1_v = df_merged[[f"{c}_F1" for c in comps]].fillna('N/A').values
+                d2_v = df_merged[[f"{c}_F2" for c in comps]].fillna('N/A').values
+                
+                # Check for any mismatch across columns
                 mask = (d1_v != d2_v).any(axis=1)
                 
                 if mask.any():
-                    parts = [df1_m.loc[mask, keys].reset_index(drop=True)]
+                    # Build report for mismatched rows
+                    report_df = df_merged.loc[mask, keys].copy()
                     for col in comps:
-                        v1, v2 = df1_m.loc[mask, col], df2_m.loc[mask, col]
-                        status = np.where(v1.fillna('N/A') == v2.fillna('N/A'), "Yes", "No")
-                        parts.append(pd.DataFrame({
-                            f"{col}_F1": v1.reset_index(drop=True),
-                            f"{col}_F2": v2.reset_index(drop=True),
-                            f"{col}_Equal": status
-                        }))
-                    final_report = pd.concat(parts, axis=1)
+                        v1 = df_merged.loc[mask, f"{col}_F1"]
+                        v2 = df_merged.loc[mask, f"{col}_F2"]
+                        report_df[f"{col}_F1"] = v1
+                        report_df[f"{col}_F2"] = v2
+                        report_df[f"{col}_Equal"] = np.where(v1.fillna('N/A') == v2.fillna('N/A'), "Yes", "No")
+                    final_report = report_df
 
-            # Save results to session state
+            # Calculate Orphans using sets for speed
+            s1 = set(df1[keys].itertuples(index=False, name=None))
+            s2 = set(df2[keys].itertuples(index=False, name=None))
+            
             st.session_state['audit'] = {
                 'report': final_report,
-                'orphans_f1': df1.set_index(keys).loc[list(s1 - s2)].reset_index(),
-                'orphans_f2': df2.set_index(keys).loc[list(s2 - s1)].reset_index(),
-                'metrics': (len(matched_idx), len(s1 - s2), len(s2 - s1))
+                'orphans_f1': df1[~df1[keys].apply(tuple, axis=1).isin(s2)],
+                'orphans_f2': df2[~df2[keys].apply(tuple, axis=1).isin(s1)],
+                'metrics': (len(df_merged), len(s1 - s2), len(s2 - s1))
             }
 
     # 7. RESULTS DISPLAY & EXPORT
     if 'audit' in st.session_state:
         res = st.session_state['audit']
-        
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Matched Records", res['metrics'][0])
         m2.metric("Only in File 1", res['metrics'][1])
         m3.metric("Only in File 2", res['metrics'][2])
-        m4.metric("Values Mismatched Records", len(res['report']))
+        m4.metric("Mismatch Rows", len(res['report']))
 
         if not res['report'].empty:
-            if len(res['report']) > 3000:
-                st.warning("⚠️ High cell count! Displaying first 3,000 rows. Download for full data.")
-                display_df = res['report'].head(3000)
-            else:
-                display_df = res['report']
-
             st.dataframe(
-                display_df.style.map(lambda x: 'background-color: #ffcccc; color: #900' if x == "No" else ''),
+                res['report'].head(3000).style.map(lambda x: 'background-color: #ffcccc; color: #900' if x == "No" else ''),
                 use_container_width=True
             )
         else:
@@ -139,7 +151,7 @@ if file1 and file2:
 
         st.divider()
         st.subheader("📥 Export Audit Report")
-        fmt = st.radio("Select Format:", ["Excel", "CSV"], horizontal=True)
+        fmt = st.radio("Format:", ["Excel", "CSV"], horizontal=True)
 
         if fmt == "Excel":
             buf = io.BytesIO()
@@ -147,10 +159,7 @@ if file1 and file2:
                 if not res['report'].empty: res['report'].to_excel(writer, index=False, sheet_name='Mismatches')
                 res['orphans_f1'].to_excel(writer, index=False, sheet_name='Only_F1')
                 res['orphans_f2'].to_excel(writer, index=False, sheet_name='Only_F2')
-            st.download_button("💾 Download All as Excel", buf.getvalue(), "Audit_Report.xlsx")
+            st.download_button("💾 Download All", buf.getvalue(), "Audit_Report.xlsx")
         else:
-            ec1, ec2, ec3 = st.columns(3)
             if not res['report'].empty: 
-                ec1.download_button("📄 Mismatches (CSV)", to_csv_bytes(res['report']), "mismatches.csv")
-            ec2.download_button("📄 File 1 Orphans (CSV)", to_csv_bytes(res['orphans_f1']), "f1_orphans.csv")
-            ec3.download_button("📄 File 2 Orphans (CSV)", to_csv_bytes(res['orphans_f2']), "f2_orphans.csv")
+                st.download_button("📄 Mismatches (CSV)", to_csv_bytes(res['report']), "mismatches.csv")
